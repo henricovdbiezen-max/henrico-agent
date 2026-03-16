@@ -13,9 +13,6 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 JOUW_EMAIL = os.environ.get("JOUW_EMAIL", "henricovdbiezen@gmail.com")
-GMAIL_API_KEY = os.environ.get("GMAIL_API_KEY", "")
-GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
@@ -25,282 +22,155 @@ flask_app = Flask(__name__)
 handler = SlackRequestHandler(slack_app)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# --- Tools definitie voor Claude ---
-TOOLS = [
-    {
-        "name": "zoek_weerbericht",
-        "description": "Zoekt het weerbericht op voor een opgegeven stad in Nederland.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "stad": {
-                    "type": "string",
-                    "description": "De naam van de stad, bijv. 'Nijkerk' of 'Amsterdam'"
-                }
-            },
-            "required": ["stad"]
-        }
-    },
-    {
-        "name": "zoek_nieuws",
-        "description": "Zoekt recent nieuws of informatie op over een onderwerp.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "onderwerp": {
-                    "type": "string",
-                    "description": "Het onderwerp om nieuws over te zoeken"
-                }
-            },
-            "required": ["onderwerp"]
-        }
-    },
-    {
-        "name": "stuur_email",
-        "description": "Stelt een e-mail op en stuurt deze naar een ontvanger via Gmail.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "aan": {
-                    "type": "string",
-                    "description": "E-mailadres van de ontvanger"
-                },
-                "onderwerp": {
-                    "type": "string",
-                    "description": "Het onderwerp van de e-mail"
-                },
-                "inhoud": {
-                    "type": "string",
-                    "description": "De inhoud/tekst van de e-mail"
-                }
-            },
-            "required": ["aan", "onderwerp", "inhoud"]
-        }
-    },
-    {
-        "name": "bekijk_agenda",
-        "description": "Bekijkt de Google Calendar agenda voor de komende dagen.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dagen": {
-                    "type": "integer",
-                    "description": "Hoeveel dagen vooruit je wil kijken (standaard 7)"
-                }
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "maak_afspraak",
-        "description": "Maakt een nieuwe afspraak aan in Google Calendar.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "titel": {
-                    "type": "string",
-                    "description": "De naam/titel van de afspraak"
-                },
-                "datum": {
-                    "type": "string",
-                    "description": "Datum en tijd van de afspraak in formaat YYYY-MM-DD HH:MM"
-                },
-                "duur_minuten": {
-                    "type": "integer",
-                    "description": "Duur van de afspraak in minuten"
-                },
-                "beschrijving": {
-                    "type": "string",
-                    "description": "Optionele beschrijving van de afspraak"
-                }
-            },
-            "required": ["titel", "datum"]
-        }
-    }
-]
-
-# --- Tool uitvoering functies ---
-
-def zoek_weerbericht(stad):
-    if WEATHER_API_KEY:
-        try:
-            url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q={stad}&days=3&lang=nl"
-            r = requests.get(url, timeout=5)
-            data = r.json()
-            current = data["current"]
-            forecast = data["forecast"]["forecastday"]
-            result = f"🌤️ Weerbericht voor {stad}:\n"
-            result += f"Nu: {current['temp_c']}°C, {current['condition']['text']}\n\n"
-            result += "Komende dagen:\n"
-            for dag in forecast:
-                result += f"• {dag['date']}: max {dag['day']['maxtemp_c']}°C, min {dag['day']['mintemp_c']}°C, {dag['day']['condition']['text']}\n"
-            return result
-        except Exception as e:
-            return f"Weerbericht ophalen mislukt: {str(e)}"
-    else:
-        # Gratis fallback via wttr.in
-        try:
-            url = f"https://wttr.in/{stad}?format=j1"
-            r = requests.get(url, timeout=5)
-            data = r.json()
-            current = data["current_condition"][0]
-            temp = current["temp_C"]
-            desc = current["weatherDesc"][0]["value"]
-            return f"🌤️ Weerbericht voor {stad}:\nNu: {temp}°C, {desc}\n(Tip: voeg een gratis WeatherAPI key toe voor meer details)"
-        except Exception as e:
-            return f"Weerbericht ophalen mislukt: {str(e)}"
-
-def zoek_nieuws(onderwerp):
-    if NEWS_API_KEY:
-        try:
-            url = f"https://newsapi.org/v2/everything?q={onderwerp}&language=nl&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
-            r = requests.get(url, timeout=5)
-            data = r.json()
-            articles = data.get("articles", [])
-            if not articles:
-                return f"Geen nieuws gevonden over '{onderwerp}'"
-            result = f"📰 Nieuws over '{onderwerp}':\n\n"
-            for a in articles[:3]:
-                result += f"• **{a['title']}**\n  {a['source']['name']} — {a['publishedAt'][:10]}\n  {a.get('description', '')}\n\n"
-            return result
-        except Exception as e:
-            return f"Nieuws ophalen mislukt: {str(e)}"
-    else:
-        return f"📰 Nieuws zoeken naar '{onderwerp}':\nVoeg een gratis NewsAPI key toe via newsapi.org om nieuws op te halen. Ik kan je wel algemene informatie geven over dit onderwerp!"
-
-def stuur_email(aan, onderwerp, inhoud):
-    try:
-        import smtplib
-        from email.mime.text import MIMEText
-        gmail_user = os.environ.get("GMAIL_USER", "")
-        gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
-        if not gmail_user or not gmail_pass:
-            return f"📧 E-mail opgesteld maar nog niet verzonden.\n\nAan: {aan}\nOnderwerp: {onderwerp}\nInhoud:\n{inhoud}\n\n⚠️ Voeg GMAIL_USER en GMAIL_APP_PASSWORD toe als omgevingsvariabelen om e-mails automatisch te versturen."
-        msg = MIMEText(inhoud)
-        msg["Subject"] = onderwerp
-        msg["From"] = gmail_user
-        msg["To"] = aan
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(gmail_user, gmail_pass)
-            server.send_message(msg)
-        return f"✅ E-mail verstuurd!\nAan: {aan}\nOnderwerp: {onderwerp}"
-    except Exception as e:
-        return f"E-mail versturen mislukt: {str(e)}"
-
-def bekijk_agenda(dagen=7):
-    if not GOOGLE_API_KEY:
-        return "📅 Agenda bekijken: Voeg een GOOGLE_API_KEY toe om je agenda te bekijken."
-    try:
-        now = datetime.datetime.utcnow().isoformat() + "Z"
-        later = (datetime.datetime.utcnow() + datetime.timedelta(days=dagen)).isoformat() + "Z"
-        url = f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events"
-        params = {
-            "key": GOOGLE_API_KEY,
-            "timeMin": now,
-            "timeMax": later,
-            "singleEvents": True,
-            "orderBy": "startTime",
-            "maxResults": 10
-        }
-        r = requests.get(url, params=params, timeout=5)
-        data = r.json()
-        events = data.get("items", [])
-        if not events:
-            return f"📅 Geen afspraken de komende {dagen} dagen."
-        result = f"📅 Jouw agenda (komende {dagen} dagen):\n\n"
-        for e in events:
-            start = e["start"].get("dateTime", e["start"].get("date", ""))[:16]
-            result += f"• {start} — {e.get('summary', 'Geen titel')}\n"
-        return result
-    except Exception as e:
-        return f"Agenda ophalen mislukt: {str(e)}"
-
-def maak_afspraak(titel, datum, duur_minuten=60, beschrijving=""):
-    if not GOOGLE_API_KEY:
-        return f"📅 Afspraak aangemaakt (lokaal):\n• Titel: {titel}\n• Datum: {datum}\n• Duur: {duur_minuten} minuten\n\n⚠️ Voeg een GOOGLE_API_KEY toe om afspraken echt in je agenda te zetten."
-    return f"📅 Afspraak '{titel}' op {datum} voor {duur_minuten} minuten is genoteerd! (Koppel Google Calendar OAuth voor volledige integratie)"
-
-# --- Tool router ---
-def voer_tool_uit(tool_naam, tool_input):
-    if tool_naam == "zoek_weerbericht":
-        return zoek_weerbericht(tool_input["stad"])
-    elif tool_naam == "zoek_nieuws":
-        return zoek_nieuws(tool_input["onderwerp"])
-    elif tool_naam == "stuur_email":
-        return stuur_email(tool_input["aan"], tool_input["onderwerp"], tool_input["inhoud"])
-    elif tool_naam == "bekijk_agenda":
-        return bekijk_agenda(tool_input.get("dagen", 7))
-    elif tool_naam == "maak_afspraak":
-        return maak_afspraak(
-            tool_input["titel"],
-            tool_input["datum"],
-            tool_input.get("duur_minuten", 60),
-            tool_input.get("beschrijving", "")
-        )
-    else:
-        return f"Onbekende tool: {tool_naam}"
-
 # --- Systeem prompt ---
 SYSTEEM_PROMPT = f"""Je bent Henrico's persoonlijke AI-assistent via Slack.
-
-Je helpt Henrico met:
-- 🌤️ Weerbericht opzoeken
-- 📰 Nieuws en informatie opzoeken
-- 📧 E-mails opstellen en versturen
-- 📅 Agenda bekijken en afspraken maken
 
 Vandaag is het: {datetime.datetime.now().strftime("%A %d %B %Y")}
 Henrico's e-mailadres: {JOUW_EMAIL}
 
-Gedraag je als een proactieve assistent:
-- Gebruik tools om taken echt uit te voeren
-- Antwoord altijd in het Nederlands
-- Wees kort en to-the-point
-- Als je iets gedaan hebt, bevestig dat duidelijk
-- Als je iets niet kunt, leg dan uit wat je nodig hebt
+Je kunt de volgende dingen doen:
+
+1. 🌤️ WEERBERICHT: Haal het weerbericht op via wttr.in voor elke stad
+2. 📰 NIEUWS: Zoek informatie op via je eigen kennis of geef aan wat je weet
+3. 📧 EMAIL: Stuur e-mails via Gmail MCP. Gebruik de gmail tool om een draft aan te maken.
+4. 📅 AGENDA: Geef aan dat Google Calendar koppeling nog in aanbouw is
+
+Voor e-mails: gebruik de mcp tool 'gmail' om een draft aan te maken met create_draft.
+De draft wordt aangemaakt in Gmail van {JOUW_EMAIL}.
+
+Antwoord altijd in het Nederlands, kort en duidelijk.
+Bevestig altijd wat je hebt gedaan.
 """
 
-# --- Agentic loop: voer taken uit met tools ---
-def verwerk_bericht(gebruiker_bericht):
-    messages = [{"role": "user", "content": gebruiker_bericht}]
-    
-    # Maximaal 5 rondes tool gebruik
-    for _ in range(5):
+# --- Weerbericht ophalen ---
+def zoek_weerbericht(stad):
+    try:
+        url = f"https://wttr.in/{stad}?format=j1"
+        r = requests.get(url, timeout=8)
+        data = r.json()
+        current = data["current_condition"][0]
+        temp = current["temp_C"]
+        feels = current["FeelsLikeC"]
+        desc = current["weatherDesc"][0]["value"]
+        humidity = current["humidity"]
+
+        forecast = data.get("weather", [])
+        result = f"🌤️ Weerbericht voor {stad}:\n"
+        result += f"Nu: {temp}°C (voelt als {feels}°C), {desc}, vochtigheid: {humidity}%\n\n"
+
+        dagen = ["Vandaag", "Morgen", "Overmorgen"]
+        for i, dag in enumerate(forecast[:3]):
+            max_temp = dag["maxtempC"]
+            min_temp = dag["mintempC"]
+            dag_desc = dag["hourly"][4]["weatherDesc"][0]["value"]
+            neerslag = dag["hourly"][4].get("precipMM", "0")
+            result += f"• {dagen[i]}: {min_temp}°C - {max_temp}°C, {dag_desc}, neerslag: {neerslag}mm\n"
+
+        return result
+    except Exception as e:
+        return f"Weerbericht ophalen mislukt: {str(e)}"
+
+# --- Email versturen via Claude met Gmail MCP ---
+def stuur_email_via_mcp(aan, onderwerp, inhoud):
+    try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1500,
-            system=SYSTEEM_PROMPT,
-            tools=TOOLS,
-            messages=messages
+            max_tokens=1000,
+            system=f"Je bent een e-mail assistent. Maak een Gmail draft aan met de opgegeven gegevens. Bevestig daarna in het Nederlands dat de draft is aangemaakt.",
+            mcp_servers=[
+                {
+                    "type": "url",
+                    "url": "https://gmail.mcp.claude.com/mcp",
+                    "name": "gmail"
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Maak een Gmail draft aan:\nAan: {aan}\nOnderwerp: {onderwerp}\nInhoud: {inhoud}"
+                }
+            ]
         )
-        
-        # Klaar — geen tools meer nodig
-        if response.stop_reason == "end_turn":
-            tekst = ""
-            for blok in response.content:
-                if hasattr(blok, "text"):
-                    tekst += blok.text
-            return tekst
-        
-        # Claude wil een tool gebruiken
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_resultaten = []
-            
-            for blok in response.content:
-                if blok.type == "tool_use":
-                    resultaat = voer_tool_uit(blok.name, blok.input)
-                    tool_resultaten.append({
-                        "type": "tool_result",
-                        "tool_use_id": blok.id,
-                        "content": resultaat
-                    })
-            
-            messages.append({"role": "user", "content": tool_resultaten})
-        else:
-            break
-    
-    return "Ik kon de taak niet voltooien. Probeer het opnieuw."
+        # Haal de tekstresponse op
+        for blok in response.content:
+            if hasattr(blok, "text"):
+                return f"📧 {blok.text}"
+        return f"📧 E-mail draft aangemaakt!\nAan: {aan}\nOnderwerp: {onderwerp}"
+    except Exception as e:
+        return f"E-mail aanmaken mislukt: {str(e)}"
+
+# --- Agentic verwerking ---
+def verwerk_bericht(gebruiker_bericht):
+    bericht_lower = gebruiker_bericht.lower()
+
+    # Weerbericht detecteren
+    weer_woorden = ["weerbericht", "weer", "temperatuur", "regen", "zon", "graden"]
+    if any(w in bericht_lower for w in weer_woorden):
+        # Stad uit bericht halen
+        steden = ["nijkerk", "amsterdam", "utrecht", "arnhem", "rotterdam", "den haag", "eindhoven", "nijmegen"]
+        stad = "Nijkerk"  # standaard
+        for s in steden:
+            if s in bericht_lower:
+                stad = s.capitalize()
+                break
+        # Kijk of er een andere stad wordt genoemd
+        woorden = gebruiker_bericht.split()
+        for i, woord in enumerate(woorden):
+            if woord.lower() in ["voor", "in", "van"] and i + 1 < len(woorden):
+                mogelijke_stad = woorden[i + 1].strip(".,!?")
+                if len(mogelijke_stad) > 2:
+                    stad = mogelijke_stad
+                    break
+        return zoek_weerbericht(stad)
+
+    # E-mail detecteren
+    email_woorden = ["mail", "e-mail", "email", "stuur", "verstuur", "bericht sturen"]
+    if any(w in bericht_lower for w in email_woorden):
+        # Probeer gegevens uit bericht te halen, anders gebruik standaard
+        aan = JOUW_EMAIL
+        onderwerp = "Bericht van Henrico Agent"
+        inhoud = gebruiker_bericht
+
+        # Zoek naar emailadres in bericht
+        import re as re2
+        email_match = re2.search(r'[\w.-]+@[\w.-]+\.\w+', gebruiker_bericht)
+        if email_match:
+            aan = email_match.group()
+
+        # Laat Claude de details invullen
+        try:
+            prep_response = claude.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                system="Extraheer uit het verzoek: aan wie (emailadres), het onderwerp en de inhoud van de e-mail. Geef terug als JSON: {\"aan\": \"...\", \"onderwerp\": \"...\", \"inhoud\": \"...\"}. Alleen JSON, geen uitleg.",
+                messages=[{"role": "user", "content": f"Verzoek: {gebruiker_bericht}\nStandaard emailadres als niets opgegeven: {JOUW_EMAIL}"}]
+            )
+            import json as json2
+            tekst = prep_response.content[0].text.strip()
+            tekst = tekst.replace("```json", "").replace("```", "").strip()
+            email_data = json2.loads(tekst)
+            aan = email_data.get("aan", aan)
+            onderwerp = email_data.get("onderwerp", onderwerp)
+            inhoud = email_data.get("inhoud", inhoud)
+        except:
+            pass
+
+        return stuur_email_via_mcp(aan, onderwerp, inhoud)
+
+    # Algemene vraag — stuur naar Claude
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEEM_PROMPT,
+            messages=[{"role": "user", "content": gebruiker_bericht}]
+        )
+        for blok in response.content:
+            if hasattr(blok, "text"):
+                return blok.text
+        return "Ik kon geen antwoord genereren. Probeer het opnieuw."
+    except Exception as e:
+        return f"Fout: {str(e)}"
 
 # --- Slack event handlers ---
 @slack_app.event("app_mention")
@@ -336,7 +206,7 @@ def slack_events():
 
 @flask_app.route("/", methods=["GET"])
 def health_check():
-    return "Henrico Agent v2 draait! 🤖", 200
+    return "Henrico Agent v3 draait! 🤖", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
