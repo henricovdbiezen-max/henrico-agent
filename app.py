@@ -3,6 +3,9 @@ import re
 import json
 import datetime
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
@@ -13,8 +16,8 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 JOUW_EMAIL = os.environ.get("JOUW_EMAIL", "henricovdbiezen@gmail.com")
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY", "")
-NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 # --- Apps initialiseren ---
 slack_app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
@@ -28,21 +31,18 @@ SYSTEEM_PROMPT = f"""Je bent Henrico's persoonlijke AI-assistent via Slack.
 Vandaag is het: {datetime.datetime.now().strftime("%A %d %B %Y")}
 Henrico's e-mailadres: {JOUW_EMAIL}
 
-Je kunt de volgende dingen doen:
-
-1. 🌤️ WEERBERICHT: Haal het weerbericht op via wttr.in voor elke stad
-2. 📰 NIEUWS: Zoek informatie op via je eigen kennis of geef aan wat je weet
-3. 📧 EMAIL: Stuur e-mails via Gmail MCP. Gebruik de gmail tool om een draft aan te maken.
-4. 📅 AGENDA: Geef aan dat Google Calendar koppeling nog in aanbouw is
-
-Voor e-mails: gebruik de mcp tool 'gmail' om een draft aan te maken met create_draft.
-De draft wordt aangemaakt in Gmail van {JOUW_EMAIL}.
+Je helpt Henrico met:
+- 🌤️ Weerbericht opzoeken
+- 📰 Nieuws en informatie
+- 📧 E-mails versturen
+- 📅 Agenda (Google Calendar koppeling komt later)
 
 Antwoord altijd in het Nederlands, kort en duidelijk.
 Bevestig altijd wat je hebt gedaan.
+Als je iets niet kunt, leg dan uit waarom.
 """
 
-# --- Weerbericht ophalen ---
+# --- Weerbericht ophalen via wttr.in (gratis, geen API key nodig) ---
 def zoek_weerbericht(stad):
     try:
         url = f"https://wttr.in/{stad}?format=j1"
@@ -70,50 +70,39 @@ def zoek_weerbericht(stad):
     except Exception as e:
         return f"Weerbericht ophalen mislukt: {str(e)}"
 
-# --- Email versturen via Claude met Gmail MCP ---
-def stuur_email_via_mcp(aan, onderwerp, inhoud):
+# --- E-mail versturen via Gmail SMTP (poort 587 met TLS) ---
+def stuur_email(aan, onderwerp, inhoud):
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        return f"📧 E-mail kan niet verstuurd worden — GMAIL_USER of GMAIL_APP_PASSWORD ontbreekt.\n\nOpgestelde e-mail:\nAan: {aan}\nOnderwerp: {onderwerp}\nInhoud:\n{inhoud}"
     try:
-        response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            system=f"Je bent een e-mail assistent. Maak een Gmail draft aan met de opgegeven gegevens. Bevestig daarna in het Nederlands dat de draft is aangemaakt.",
-            mcp_servers=[
-                {
-                    "type": "url",
-                    "url": "https://gmail.mcp.claude.com/mcp",
-                    "name": "gmail"
-                }
-            ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Maak een Gmail draft aan:\nAan: {aan}\nOnderwerp: {onderwerp}\nInhoud: {inhoud}"
-                }
-            ]
-        )
-        # Haal de tekstresponse op
-        for blok in response.content:
-            if hasattr(blok, "text"):
-                return f"📧 {blok.text}"
-        return f"📧 E-mail draft aangemaakt!\nAan: {aan}\nOnderwerp: {onderwerp}"
-    except Exception as e:
-        return f"E-mail aanmaken mislukt: {str(e)}"
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_USER
+        msg["To"] = aan
+        msg["Subject"] = onderwerp
+        msg.attach(MIMEText(inhoud, "plain", "utf-8"))
 
-# --- Agentic verwerking ---
+        # Gebruik poort 587 met STARTTLS (werkt op Render)
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+
+        return f"✅ E-mail verstuurd!\nAan: {aan}\nOnderwerp: {onderwerp}"
+    except smtplib.SMTPAuthenticationError:
+        return "❌ Gmail authenticatie mislukt. Controleer je GMAIL_APP_PASSWORD op Render."
+    except Exception as e:
+        return f"❌ E-mail versturen mislukt: {str(e)}"
+
+# --- Claude bepaalt wat er moet gebeuren ---
 def verwerk_bericht(gebruiker_bericht):
     bericht_lower = gebruiker_bericht.lower()
 
     # Weerbericht detecteren
-    weer_woorden = ["weerbericht", "weer", "temperatuur", "regen", "zon", "graden"]
+    weer_woorden = ["weerbericht", "weer", "temperatuur", "regen", "zon", "graden", "buien"]
     if any(w in bericht_lower for w in weer_woorden):
-        # Stad uit bericht halen
-        steden = ["nijkerk", "amsterdam", "utrecht", "arnhem", "rotterdam", "den haag", "eindhoven", "nijmegen"]
-        stad = "Nijkerk"  # standaard
-        for s in steden:
-            if s in bericht_lower:
-                stad = s.capitalize()
-                break
-        # Kijk of er een andere stad wordt genoemd
+        stad = "Nijkerk"
         woorden = gebruiker_bericht.split()
         for i, woord in enumerate(woorden):
             if woord.lower() in ["voor", "in", "van"] and i + 1 < len(woorden):
@@ -124,40 +113,29 @@ def verwerk_bericht(gebruiker_bericht):
         return zoek_weerbericht(stad)
 
     # E-mail detecteren
-    email_woorden = ["mail", "e-mail", "email", "stuur", "verstuur", "bericht sturen"]
+    email_woorden = ["mail", "e-mail", "email", "stuur", "verstuur"]
     if any(w in bericht_lower for w in email_woorden):
-        # Probeer gegevens uit bericht te halen, anders gebruik standaard
-        aan = JOUW_EMAIL
-        onderwerp = "Bericht van Henrico Agent"
-        inhoud = gebruiker_bericht
-
-        # Zoek naar emailadres in bericht
-        import re as re2
-        email_match = re2.search(r'[\w.-]+@[\w.-]+\.\w+', gebruiker_bericht)
-        if email_match:
-            aan = email_match.group()
-
-        # Laat Claude de details invullen
         try:
             prep_response = claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=500,
-                system="Extraheer uit het verzoek: aan wie (emailadres), het onderwerp en de inhoud van de e-mail. Geef terug als JSON: {\"aan\": \"...\", \"onderwerp\": \"...\", \"inhoud\": \"...\"}. Alleen JSON, geen uitleg.",
-                messages=[{"role": "user", "content": f"Verzoek: {gebruiker_bericht}\nStandaard emailadres als niets opgegeven: {JOUW_EMAIL}"}]
+                system=f'Extraheer uit het verzoek: aan wie (emailadres), het onderwerp en de inhoud van de e-mail. Standaard emailadres als niets opgegeven: {JOUW_EMAIL}. Geef terug als JSON: {{"aan": "...", "onderwerp": "...", "inhoud": "..."}}. Alleen JSON, geen uitleg.',
+                messages=[{"role": "user", "content": gebruiker_bericht}]
             )
-            import json as json2
             tekst = prep_response.content[0].text.strip()
             tekst = tekst.replace("```json", "").replace("```", "").strip()
-            email_data = json2.loads(tekst)
-            aan = email_data.get("aan", aan)
-            onderwerp = email_data.get("onderwerp", onderwerp)
-            inhoud = email_data.get("inhoud", inhoud)
-        except:
-            pass
+            email_data = json.loads(tekst)
+            aan = email_data.get("aan", JOUW_EMAIL)
+            onderwerp = email_data.get("onderwerp", "Bericht van Henrico Agent")
+            inhoud = email_data.get("inhoud", gebruiker_bericht)
+        except Exception:
+            aan = JOUW_EMAIL
+            onderwerp = "Bericht van Henrico Agent"
+            inhoud = gebruiker_bericht
 
-        return stuur_email_via_mcp(aan, onderwerp, inhoud)
+        return stuur_email(aan, onderwerp, inhoud)
 
-    # Algemene vraag — stuur naar Claude
+    # Algemene vraag via Claude
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-20250514",
@@ -206,7 +184,7 @@ def slack_events():
 
 @flask_app.route("/", methods=["GET"])
 def health_check():
-    return "Henrico Agent v3 draait! 🤖", 200
+    return "Henrico Agent v4 draait! 🤖", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
